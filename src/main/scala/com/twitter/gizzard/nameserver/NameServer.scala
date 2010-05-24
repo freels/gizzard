@@ -3,15 +3,64 @@ package com.twitter.gizzard.nameserver
 import java.util.TreeMap
 import scala.collection.mutable
 import com.twitter.xrayspecs.Time
+import com.twitter.querulous.StatsCollector
+import com.twitter.querulous.evaluator.QueryEvaluatorFactory
+import net.lag.configgy.ConfigMap
+import net.lag.logging.{Logger, ThrottledLogger}
 import shards._
 
 
 class NonExistentShard extends ShardException("Shard does not exist")
 class InvalidShard extends ShardException("Shard has invalid attributes (such as hostname)")
 
+object NameServer {
+  /**
+   * nameserver (inherit="db") {
+   *   mapping = "byte_swapper"
+   *   replicas {
+   *     ns1 (inherit="db") {
+   *       hostname = "nameserver1"
+   *       database = "shards"
+   *     }
+   *     ns2 (inherit="db") {
+   *       hostname = "nameserver2"
+   *       database = "shards"
+   *     }
+   *   }
+   * }
+   */
+  def apply[S <: shards.Shard](config: ConfigMap, stats: Option[StatsCollector],
+                               shardRepository: ShardRepository[S],
+                               log: ThrottledLogger[String],
+                               replicationFuture: Future): NameServer[S] = {
+    val queryEvaluatorFactory = QueryEvaluatorFactory.fromConfig(config, stats)
+
+    val replicaConfig = config.configMap("replicas")
+    val replicas = replicaConfig.keys.map { key =>
+      new SqlShard(queryEvaluatorFactory(replicaConfig.configMap(key)))
+    }.collect
+
+    val shardInfo = new ShardInfo("com.twitter.gizzard.nameserver.ReplicatingShard", "", "")
+    val loadBalancer = new LoadBalancer(replicas)
+    val shard = new ReadWriteShardAdapter(
+      new ReplicatingShard(shardInfo, 0, replicas, loadBalancer, log, replicationFuture))
+
+    val mappingFunction: (Long => Long) = config.getString("mapping") match {
+      case None =>
+        { n => n }
+      case Some("byte_swapper") =>
+        ByteSwapper
+      case Some("identity") =>
+        { n => n }
+    }
+    new NameServer(shard, shardRepository, mappingFunction)
+  }
+}
+
 class NameServer[S <: shards.Shard](nameServerShard: Shard, shardRepository: ShardRepository[S],
                                     mappingFunction: Long => Long)
   extends Shard {
+
   val children = List()
   val shardInfo = new ShardInfo("com.twitter.gizzard.nameserver.NameServer", "", "")
   val weight = 1 // hardcode for now
